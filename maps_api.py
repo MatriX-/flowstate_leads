@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional, Set
 from playwright.sync_api import sync_playwright, TimeoutError
 import time
 import random
@@ -9,6 +9,9 @@ import json
 from rich.console import Console
 import urllib.parse
 from maps_logger import setup_logger
+from concurrent.futures import ThreadPoolExecutor
+from itertools import cycle
+import uuid
 
 logger = setup_logger()
 console = Console()
@@ -19,49 +22,74 @@ class SearchRequest(BaseModel):
     state: str
     num_leads: int
     search_terms: List[str] = ["smoke shop", "vape shop", "tobacco shop"]
+    existing_names: Optional[List[str]] = None
+    existing_addresses: Optional[List[str]] = None
 
 def get_search_url(term, city, state):
     """Generate direct Google Maps search URL for specific city/state"""
-    # Encode the exact location we want to search in
+    # Encode the search term and location separately
     location = urllib.parse.quote(f"{city}, {state}")
-    # Encode the search term
     query = urllib.parse.quote(f"{term}")
-    # Use 'in' syntax to force Google to search within the specified city
-    return f"https://www.google.com/maps/search/{query}+in+{location}"
+    # Use a simpler URL format that's more reliable
+    return f"https://www.google.com/maps/search/{query}+near+{location}"
 
 def extract_business_info(page, listing):
     """Extract business information from a listing element"""
     try:
+        # Add initial wait for stability
+        time.sleep(0.5)
+        
         name = ""
         name_el = listing.query_selector('.qBF1Pd')
         if name_el:
             name = name_el.inner_text()
             
-            # Skip if business name contains "cigar" (case insensitive)
             if 'cigar' in name.lower():
                 return None
         
         address = ""
         phone = ""
         
-        # Click the listing to open details panel
         try:
-            listing.click()
-            time.sleep(random.uniform(0.5, 1))
+            # Add more robust clicking
+            listing.click(timeout=2000)
+            time.sleep(1)  # Increased wait time
             
-            # Look for the address in the details panel
-            address_button = page.query_selector('button[data-item-id="address"]')
-            if address_button:
-                address = address_button.inner_text().strip()
+            # Try multiple selectors for address
+            address_selectors = [
+                'button[data-item-id="address"]',
+                '[data-item-id*="address"]',
+                '.rogA2c'
+            ]
             
-            # Look for phone in details panel
-            phone_button = page.query_selector('button[data-item-id*="phone"]')
-            if phone_button:
-                phone = phone_button.inner_text().strip()
-                
+            for selector in address_selectors:
+                try:
+                    address_el = page.wait_for_selector(selector, timeout=2000, state='visible')
+                    if address_el:
+                        address = address_el.inner_text().strip()
+                        break
+                except:
+                    continue
+            
+            # Try multiple selectors for phone
+            phone_selectors = [
+                'button[data-item-id*="phone"]',
+                '[data-item-id*="phone"]',
+                '.rogA2c span.UsdlK'
+            ]
+            
+            for selector in phone_selectors:
+                try:
+                    phone_el = page.wait_for_selector(selector, timeout=2000, state='visible')
+                    if phone_el:
+                        phone = phone_el.inner_text().strip()
+                        break
+                except:
+                    continue
+
         except Exception as e:
             logger.warning(f"Error clicking listing or extracting details: {str(e)}")
-            # Fallback to original method if clicking fails
+            # Fallback method remains the same...
             info_containers = listing.query_selector_all('.W4Efsd')
             for container in info_containers:
                 container_text = container.inner_text()
@@ -79,7 +107,8 @@ def extract_business_info(page, listing):
                     if phone_el:
                         phone = phone_el.inner_text().strip()
 
-        if name:
+        # Only return results if we have both a name and a phone number
+        if name and phone:
             result = {
                 'name': name,
                 'address': address,
@@ -95,35 +124,26 @@ def extract_business_info(page, listing):
         return None
 
 def load_more_results(page):
-    """Attempt to load more results by scrolling the results panel"""
+    """Optimized version of loading more results"""
     try:
         initial_results = len(page.query_selector_all('.Nv2PK'))
         
-        # Make sure the panel is focused
-        panel = page.query_selector('.DxyBCb')
-        if panel:
-            panel.click()
+        # Scroll the results panel
+        page.evaluate("""
+            const panel = document.querySelector('.DxyBCb');
+            if (panel) {
+                panel.scrollTo({
+                    top: panel.scrollHeight,
+                    behavior: 'smooth'
+                });
+            }
+        """)
         
-        # Scroll in larger increments
-        last_results_count = initial_results
-        max_attempts = 10
+        # Wait briefly for new results to load
+        time.sleep(0.3)
         
-        for _ in range(max_attempts):
-            # Scroll multiple times quickly
-            for _ in range(5):
-                page.keyboard.press('PageDown')
-                time.sleep(random.uniform(0.2, 0.3))
-            
-            new_results = len(page.query_selector_all('.Nv2PK'))
-            if new_results <= last_results_count:
-                page.keyboard.press('End')
-                time.sleep(random.uniform(0.3, 0.5))
-                final_check = len(page.query_selector_all('.Nv2PK'))
-                return final_check > initial_results
-            
-            last_results_count = new_results
-        
-        return True
+        new_results = len(page.query_selector_all('.Nv2PK'))
+        return new_results > initial_results
         
     except Exception as e:
         logger.error(f"Error while scrolling: {str(e)}")
@@ -131,68 +151,92 @@ def load_more_results(page):
 
 @app.post("/scrape")
 def scrape_locations(request: SearchRequest):
-    """
-    API endpoint to scrape business locations based on search criteria
-    """
-    logger.info(f"Received scraping request for {request.city}, {request.state}")
-    logger.info(f"Search terms: {request.search_terms}")
-    logger.info(f"Requested leads: {request.num_leads}")
+    """Modified scraping endpoint with concurrent browser contexts"""
+    logger.info(f"Starting scrape for {request.city}, {request.state}")
     
     all_results = []
-    processed_addresses = set()
+    processed_addresses = set(request.existing_addresses or [])
+    existing_names = set(request.existing_names or [])
 
     try:
         with sync_playwright() as p:
-            logger.info("Launching browser")
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(viewport={'width': 1920, 'height': 1080})
-            page = context.new_page()
+            logger.info("Browser launched successfully")
             
-            for term in request.search_terms:
+            # Create multiple browser contexts
+            contexts = []
+            pages = []
+            
+            # Only create contexts/pages until we have enough results
+            for i, term in enumerate(request.search_terms):
                 if len(all_results) >= request.num_leads:
-                    logger.info("Reached desired number of leads")
                     break
                     
-                logger.info(f"Searching for term: {term}")
-                search_url = get_search_url(term, request.city, request.state)
-                logger.debug(f"Search URL: {search_url}")
+                context = browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent=f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/96.0.{i}.0'
+                )
+                contexts.append(context)
                 
-                page.goto(search_url)
-                time.sleep(random.uniform(1, 1.5))
+                page = context.new_page()
+                pages.append(page)
+                
+                search_url = get_search_url(term, request.city, request.state)
+                logger.info(f"Searching for {term} in {request.city}, {request.state}")
+                page.goto(search_url, wait_until='networkidle')
+                time.sleep(2)
+                
+                # Process results from this page immediately
+                result_items = page.query_selector_all('.Nv2PK')
+                if not result_items:
+                    logger.warning(f"No results found for term: {term}")
+                    continue
 
-                while len(all_results) < request.num_leads:
-                    try:
-                        page.wait_for_selector('.Nv2PK', timeout=15000)
-                        result_items = page.query_selector_all('.Nv2PK')
-                        
-                        if not result_items:
-                            logger.warning("No results found for current search")
-                            break
-
-                        logger.info(f"Found {len(result_items)} results on current page")
-                        for item in result_items:
-                            if len(all_results) >= request.num_leads:
-                                break
-                                
-                            info = extract_business_info(page, item)
-                            if info and info['address'] and info['address'] not in processed_addresses:
-                                processed_addresses.add(info['address'])
-                                info['search_term'] = term
-                                all_results.append(info)
-                                logger.info(f"Added business: {info['name']}")
-                            
-                            time.sleep(random.uniform(0.2, 0.3))
-
-                        if len(all_results) < request.num_leads:
-                            if not load_more_results(page):
-                                logger.info("No more results to load")
-                                break
-
-                    except TimeoutError:
-                        logger.warning(f"Timeout while loading results for term: {term}")
+                for item in result_items:
+                    if len(all_results) >= request.num_leads:
                         break
+                        
+                    info = extract_business_info(page, item)
+                    if (info and info['address'] and 
+                        info['address'] not in processed_addresses and 
+                        info['name'] not in existing_names):
+                        
+                        processed_addresses.add(info['address'])
+                        existing_names.add(info['name'])
+                        info['search_term'] = term
+                        all_results.append(info)
+                        logger.info(f"Found business: {info['name']}")
+                    
+                    time.sleep(0.1)
 
-            logger.info("Closing browser")
+                # Only try to load more if we still need results
+                while len(all_results) < request.num_leads:
+                    if not load_more_results(page):
+                        break
+                    
+                    new_items = page.query_selector_all('.Nv2PK')
+                    for item in new_items:
+                        if len(all_results) >= request.num_leads:
+                            break
+                            
+                        info = extract_business_info(page, item)
+                        if (info and info['address'] and 
+                            info['address'] not in processed_addresses and 
+                            info['name'] not in existing_names):
+                            
+                            processed_addresses.add(info['address'])
+                            existing_names.add(info['name'])
+                            info['search_term'] = term
+                            all_results.append(info)
+                            logger.info(f"Found business: {info['name']}")
+                        
+                        time.sleep(0.1)
+
+            # Cleanup
+            for page in pages:
+                page.close()
+            for context in contexts:
+                context.close()
             browser.close()
 
     except Exception as e:
@@ -203,7 +247,6 @@ def scrape_locations(request: SearchRequest):
         logger.warning("No results found for the search criteria")
         raise HTTPException(status_code=404, detail="No results found")
 
-    logger.info(f"Successfully found {len(all_results)} leads")
     return {
         "status": "success",
         "location": {
@@ -218,6 +261,19 @@ def scrape_locations(request: SearchRequest):
 def health_check():
     logger.debug("Health check requested")
     return {"status": "healthy"}
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    logger.info(f"Request {request_id} started - {request.method} {request.url.path}")
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    logger.info(
+        f"Request {request_id} completed - Duration: {duration:.2f}s, "
+        f"Client: {request.client.host}"
+    )
+    return response
 
 if __name__ == "__main__":
     import uvicorn
